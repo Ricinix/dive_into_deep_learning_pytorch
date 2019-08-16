@@ -304,7 +304,7 @@ def train_and_predict_rnn(rnn, get_params, init_rnn_state, num_hiddens,
         # 若是相邻采样，则刚开始就初始化隐藏状态
         if not is_random_iter:
             state = init_rnn_state(batch_size, num_hiddens, device)
-        l_sum, n, start = 0.0, 0, time.time()
+        l_sum, n, start = 0.0, 0, time()
         data_iter = data_iter_fn(corpus_indices, batch_size, num_steps, device)
         for X, Y in data_iter:
             if is_random_iter:  # 随机采样需要在每个批量之间初始化隐藏状态
@@ -319,7 +319,7 @@ def train_and_predict_rnn(rnn, get_params, init_rnn_state, num_hiddens,
             outputs, state = rnn(inputs, state, params)  # 计算输出值（index）以及隐藏状态
             outputs = torch.cat(outputs, dim=0)  # 每一行样本都有一个output来组成一个列表，此处将列表拼接起来
             y = Y.t().reshape(-1,)
-            l = loss(outputs, y).mean()
+            l = loss(outputs, y)
 
             l.backward()
             with torch.no_grad():
@@ -330,7 +330,7 @@ def train_and_predict_rnn(rnn, get_params, init_rnn_state, num_hiddens,
 
         if (epoch + 1) % pred_period == 0:
             print('epoch %d, perplexity %f, time %.2f sec' % (
-                epoch + 1, math.exp(l_sum / n), time.time() - start))
+                epoch + 1, math.exp(l_sum / n), time() - start))
             for prefix in prefixes:
                 print(' -', predict_rnn(
                     prefix, pred_len, rnn, params, init_rnn_state,
@@ -348,3 +348,54 @@ def predict_rnn_nn(prefix, num_chars, model, device, idx_to_char, char_to_idx):
         else:
             output.append(int(Y.argmax(dim=1).item()))
     return ''.join([idx_to_char[i] for i in output])
+
+
+def train_and_predict_rnn_nn(model, device,corpus_indices, idx_to_char,
+                             char_to_idx, num_epochs, num_steps, lr, clipping_theta,
+                             batch_size, pred_period, pred_len, prefixes):
+    loss = nn.CrossEntropyLoss()
+    trainer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0, weight_decay=0)
+
+    for epoch in range(num_epochs):
+        l_sum, n, start = 0.0, 0, time()
+        data_iter = data_iter_consecutive(corpus_indices, batch_size, num_steps, device)
+        state = model.begin_state(batch_size=batch_size, device=device)
+        for X, Y in data_iter:
+            state.detach_()
+
+            output, state = model(X.type(torch.long), state)
+            y = Y.t().reshape(-1,).type(torch.long)
+            l = loss(output, y)
+            l.backward()
+            # params = [p for p in model.parameters()]
+            # d2l.grad_clipping(params, clipping_theta, device)
+            nn.utils.clip_grad_norm_(model.parameters(), clipping_theta)
+            trainer.step()
+            trainer.zero_grad()
+
+            l_sum += l.item() * y.size(0)
+            n += y.size(0)
+
+        if (epoch + 1) % pred_period == 0:
+            print('epoch %d, perplexity %f, time %.2f sec' % (
+                epoch + 1, math.exp(l_sum / n), time() - start))
+            for prefix in prefixes:
+                print(' -', predict_rnn_nn(prefix, pred_len, model, device, idx_to_char, char_to_idx))
+
+
+class RNNModel(nn.Module):
+    def __init__(self, rnn_layer, num_hiddens, vocab_size):
+        super().__init__()
+        self.rnn = rnn_layer
+        self.vocab_size = vocab_size
+        self.num_hiddens = num_hiddens
+        self.linear = nn.Linear(self.num_hiddens, vocab_size)
+
+    def begin_state(self, batch_size, device=torch.device('cpu'), num_state=1):
+        return torch.rand(num_state, batch_size, self.num_hiddens, device=device)
+
+    def forward(self, inputs, state):
+        X = one_hot2(inputs.t(), self.vocab_size)
+        Y, state = self.rnn(X, state)
+        output = self.linear(Y.view(-1, Y.shape[-1]))
+        return output, state

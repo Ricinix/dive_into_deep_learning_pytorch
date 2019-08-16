@@ -101,7 +101,7 @@ def train_and_predict_rnn(rnn, get_params, init_rnn_state, num_hiddens,
             outputs, state = rnn(inputs, state, params)  # 计算输出值（index）以及隐藏状态
             outputs = torch.cat(outputs, dim=0)  # 每一行样本都有一个output来组成一个列表，此处将列表拼接起来
             y = Y.t().reshape(-1,)
-            l = loss(outputs, y).mean()
+            l = loss(outputs, y)
 
             l.backward()
             with torch.no_grad():
@@ -140,11 +140,11 @@ if __name__ == '__main__':
     #                 torch.device('cuda'), idx_to_char, char_to_idx)
     # print(o)
 
-    num_hiddens, device= 256, torch.device('cuda')
+    num_hiddens, device = 256, torch.device('cuda')
     num_epochs, num_steps, batch_size, lr, clipping_theta = 250, 35, 32, 1e2, 1e-2
     pred_period, pred_len, prefixes = 50, 50, ['分开', '不分开']
     train_and_predict_rnn(rnn, get_params, init_rnn_state, num_hiddens,
                           vocab_size, device, corpus_indices, idx_to_char,
-                          char_to_idx, True, num_epochs, num_steps, lr,
+                          char_to_idx, False, num_epochs, num_steps, lr,
                           clipping_theta, batch_size, pred_period, pred_len,
                           prefixes)
