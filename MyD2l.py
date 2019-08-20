@@ -361,7 +361,11 @@ def train_and_predict_rnn_nn(model, device,corpus_indices, idx_to_char,
         data_iter = data_iter_consecutive(corpus_indices, batch_size, num_steps, device)
         state = model.begin_state(batch_size=batch_size, device=device)
         for X, Y in data_iter:
-            state.detach_()
+            if isinstance(state, tuple):
+                for s in state:
+                    s.detach_()
+            else:
+                state.detach_()
 
             output, state = model(X.type(torch.long), state)
             y = Y.t().reshape(-1,).type(torch.long)
