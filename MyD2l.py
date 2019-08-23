@@ -10,8 +10,9 @@ import matplotlib.pyplot as plt
 import torch
 from IPython import display
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 from torchvision import transforms, datasets
+import numpy as np
 
 
 # 打印
@@ -34,7 +35,7 @@ def get_fashion_mnist_labels(labels):
 
 # 平方损失
 def square_loss(y_hat, y):
-    return torch.sum((y_hat - y.reshape(y_hat.shape)).pow(2) / 2)
+    return torch.mean((y_hat - y.view(y_hat.shape)).pow(2) / 2)
 
 
 # 线性模型
@@ -403,3 +404,87 @@ class RNNModel(nn.Module):
         Y, state = self.rnn(X, state)
         output = self.linear(Y.view(-1, Y.shape[-1]))
         return output, state
+
+
+def train_2d(trainer):
+    x1, x2, s1, s2 = -5, -2, 0, 0
+    results = [(x1, x2)]
+    for i in range(20):
+        x1, x2, s1, s2 = trainer(x1, x2, s1, s2)
+        results.append((x1, x2))
+    print('epoch %d, x1 %f, x2 %f' % (i + 1, x1, x2))
+    return results
+
+
+def show_trace_2d(f, results):
+    plt.plot(*zip(*results), '-o', color='#ff7f0e')
+    x1, x2 = np.meshgrid(np.arange(-5.5, 1.0, 0.1), np.arange(-3.0, 1.0, 0.1))
+    plt.contour(x1, x2, f(x1, x2), colors='#1f77b4')
+    plt.xlabel('x1')
+    plt.ylabel('x2')
+
+
+def get_data_ch7():
+    data = np.genfromtxt(Path('deep learning/data/airfoil_self_noise.dat'), delimiter='\t')
+    data = (data - data.mean(axis=0)) / data.std(axis=0)
+    return torch.tensor(data[:1500, :-1], dtype=torch.float), torch.tensor(data[:1500, -1], dtype=torch.float)
+
+
+def train_ch7(trainer_fn, states, hyperparms, features, labels,
+              batch_size=10, num_epochs=2):
+    net, loss = linreg, square_loss
+    w = torch.normal(torch.zeros(features.shape[1], 1), 0.01)
+    b = torch.zeros(1)
+    w.requires_grad_(True)
+    b.requires_grad_(True)
+
+    def eval_loss():
+        return loss(net(features, w, b), labels).item()
+
+    ls = [eval_loss()]
+    data_iter = DataLoader(
+        TensorDataset(features, labels), batch_size, shuffle=True, num_workers=4)
+    for _ in range(num_epochs):
+        start = time()
+        for batch_i, (X, y) in enumerate(data_iter):
+            l = loss(net(X, w, b), y)
+            l.backward()
+            with torch.no_grad():
+                trainer_fn([w, b], states, hyperparms)
+            if (batch_i + 1) * batch_size % 100 == 0:
+                ls.append(eval_loss())
+    print('loss: %f, %f sec per epoch' % (ls[-1], time() - start))
+    set_figsize()
+    plt.plot(np.linspace(0, num_epochs, len(ls)), ls)
+    plt.xlabel('epoch')
+    plt.ylabel('loss')
+
+
+def train_nn_ch7(train_opitm, trainer_hyperparams, features, labels,
+                 batch_size=10, num_epochs=2):
+    net = nn.Linear(5, 1)
+    loss = nn.MSELoss()
+
+    def eval_loss():
+        return loss(net(features), labels.view(-1, 1)).item()
+
+    ls = [eval_loss()]
+    data_iter = DataLoader(
+        TensorDataset(features, labels), batch_size, shuffle=True, num_workers=4)
+    trainer = train_opitm(net.parameters(), *trainer_hyperparams)
+    for _ in range(num_epochs):
+        start = time()
+        for batch_i, (X, y) in enumerate(data_iter):
+            l = loss(net(X), y.view(-1, 1))
+            l.backward()
+            trainer.step()
+            trainer.zero_grad()
+            if (batch_i + 1) * batch_size % 100 == 0:
+                ls.append(eval_loss())
+        for param_group in trainer.param_groups:
+            param_group['lr'] *= 0.1
+    print('loss: %f, %f sec per epoch' % (ls[-1], time() - start))
+    set_figsize()
+    plt.plot(np.linspace(0, num_epochs, len(ls)), ls)
+    plt.xlabel('epoch')
+    plt.ylabel('loss')
