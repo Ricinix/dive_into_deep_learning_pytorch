@@ -13,6 +13,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 from torchvision import transforms, datasets
 import numpy as np
+from torch.nn import functional as F
 
 
 # 打印
@@ -488,3 +489,186 @@ def train_nn_ch7(train_opitm, trainer_hyperparams, features, labels,
     plt.plot(np.linspace(0, num_epochs, len(ls)), ls)
     plt.xlabel('epoch')
     plt.ylabel('loss')
+
+
+def resnet18(in_channels, output_size):
+    class Residual(nn.Module):
+        def __init__(self, in_channels, num_channels, use_1x1conv=False, strides=1):
+            super().__init__()
+            self.conv1 = nn.Conv2d(in_channels, num_channels, kernel_size=3, padding=1,
+                                   stride=strides)
+            self.conv2 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
+            if use_1x1conv:
+                self.conv3 = nn.Conv2d(in_channels, num_channels, kernel_size=1,
+                                       stride=strides)
+            else:
+                self.conv3 = None
+            self.bn1 = nn.BatchNorm2d(num_channels)
+            self.bn2 = nn.BatchNorm2d(num_channels)
+
+        def forward(self, X):
+            Y = F.relu(self.bn1(self.conv1(X)))
+            Y = self.bn2(self.conv2(Y))
+            if self.conv3:
+                X = self.conv3(X)
+            return F.relu(Y + X)
+
+    def resnet_block(in_channels, num_channels, num_residuals, first_block=False):
+        blk = nn.Sequential()
+        for i in range(num_residuals):
+            if i == 0 and not first_block:
+                blk.add_module('r%d' % i, Residual(in_channels, num_channels,
+                                                   use_1x1conv=True, strides=2))
+            else:
+                blk.add_module('r%d' % i, Residual(in_channels, num_channels))
+            in_channels = num_channels
+        return blk
+
+    net = nn.Sequential(
+        nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3),
+        nn.BatchNorm2d(64), nn.ReLU(),
+        nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+        resnet_block(64, 64, 2, first_block=True),
+        resnet_block(64, 128, 2),
+        resnet_block(128, 256, 2),
+        resnet_block(256, 512, 2),
+        nn.AdaptiveAvgPool2d(1),
+        Flatten(512),
+        nn.Linear(512, output_size)
+    )
+    return net
+
+
+def show_images(imgs, num_rows, num_cols, scale=2):
+    figsize = (num_cols * scale, num_rows * scale)
+    _, axes = plt.subplots(num_rows, num_cols, figsize=figsize)
+    for i in range(num_rows):
+        for j in range(num_cols):
+            axes[i][j].imshow(imgs[i * num_cols + j])
+            axes[i][j].axes.get_xaxis().set_visible(False)
+            axes[i][j].axes.get_yaxis().set_visible(False)
+    return axes
+
+
+def get_param_with_name(module, *m_name):
+    '''
+    :param module: 模型
+    :param m_name: 想要提取出的参数所在层名
+    :return: 参数，最后一个是其余参数
+    '''
+    filter_params = []
+    for name, m in module.named_modules():
+        if name in m_name:
+            filter_params += list(map(id, m.parameters()))
+            yield m.parameters()
+    yield filter(lambda p: id(p) not in filter_params, module.parameters())
+
+
+def bbox_to_rect(bbox, color):
+    return plt.Rectangle(
+        xy=(bbox[0], bbox[1]), width=bbox[2]-bbox[0], height=bbox[3]-bbox[1],
+        fill=False, edgecolor=color, linewidth=2)
+
+
+def multi_box_prior(X, sizes, ratios, keep_batch=True):
+    """
+    :param keep_batch: 决定输出的形状
+    :param X: 数据输入((batch,channels, height, width)或者(height, width))
+    :param sizes: 锚框大小(tuple or list)
+    :param ratios: 宽高比(tuple or list)
+    :return: 锚框(大小为实际大小，非比例)
+    """
+
+    h, w = X.shape[-2:]
+    per_box_num = len(sizes) + len(ratios) - 1
+    boxes = torch.zeros(h, w, per_box_num, 4)
+    boxes[:, :, :, 0] += torch.FloatTensor(list(range(w))).view(1, w, 1)
+    boxes[:, :, :, 2] = boxes[:, :, :, 0]
+    boxes[:, :, :, 1] += torch.FloatTensor(list(range(h))).view(h, 1, 1)
+    boxes[:, :, :, 3] = boxes[:, :, :, 1]
+
+    def _put_coordinate(width, height):
+        boxes[:, :, :, 0] -= width / 2  # left_top_x
+        boxes[:, :, :, 1] += height / 2  # left_top_y
+        boxes[:, :, :, 2] += width / 2  # right_buttom_x
+        boxes[:, :, :, 3] -= height / 2  # right_buttom_y
+
+    box_width = w * torch.FloatTensor(sizes) * math.sqrt(ratios[0])
+    box_height = h * torch.FloatTensor(sizes) / math.sqrt(ratios[0])
+    box_width = torch.cat((box_width, w * sizes[0] * torch.FloatTensor(ratios[1:]).sqrt()))
+    box_height = torch.cat((box_height, h * sizes[0] / torch.FloatTensor(ratios[1:]).sqrt()))
+    _put_coordinate(box_width.view(1, 1, per_box_num), box_height.view(1, 1, per_box_num))
+
+    if X.shape[0] != 1 and len(X.shape) == 4:
+        boxes = boxes.view(1, h * w * per_box_num, 4)
+        one_batch_boxs = boxes
+        for _ in range(X.shape[0] - 1):
+            boxes = torch.cat((boxes, one_batch_boxs), dim=0)
+    elif keep_batch:
+        return boxes.view(1, w * h * per_box_num, 4)
+
+    return boxes
+
+
+def multi_box_target(anchor: torch.tensor, labels: torch.tensor, threshold=0.5):
+    """
+    :param anchor: 锚框
+    :param labels: 真实边界框
+    :return: 类别标注、掩码变量、偏移量
+    """
+    def _jaccard(rec1, rec2):
+        left_column_max = torch.max(rec1[:, :, 0], rec2[:, :, 0])
+        right_column_min = torch.min(rec1[:, :, 2], rec2[:, :, 2])
+        up_row_max = torch.max(rec1[:, :, 1], rec2[:, :, 1])
+        down_row_min = torch.min(rec1[:, :, 3], rec2[:, :, 3])
+        S1 = (rec1[:, :, 2] - rec1[:, :, 0]) * (rec1[:, :, 3] - rec1[:, :, 1])
+        S2 = (rec2[:, :, 2] - rec2[:, :, 0]) * (rec2[:, :, 3] - rec2[:, :, 1])
+        S_cross = (down_row_min - up_row_max) * (right_column_min - left_column_max)
+        S_cross *= (S_cross > 0).type(torch.float)
+        return (S_cross / (S1 + S2 - S_cross)).view(S_cross.shape[0], 1, S_cross.shape[-1])
+
+    def _get_max_cor(iou):
+        max_dim_2 = iou.max(dim=2)
+        max_dim_1 = max_dim_2[0].max(dim=1)
+        cor = torch.cat((max_dim_1[1].view(-1, 1),
+                         max_dim_2[1].gather(dim=1, index=max_dim_1[1].view(-1, 1))), dim=1)
+        return cor
+
+    kind = labels.shape[-2]
+    box_num = anchor.shape[-2]
+    batch_size = anchor.shape[0]
+    iou = None
+    for i in range(kind):
+        if iou is None:
+            iou = _jaccard(anchor, labels[:, i, 1:].view(-1, 1, 4))
+        else:
+            iou = torch.cat((iou, _jaccard(anchor, labels[:, i, 1:].view(-1, 1, 4))), dim=1)
+    print("iou shape:\n", iou.shape)
+    print("iou: \n", iou)
+    box_kind = torch.zeros(batch_size, box_num)
+    for _ in range(box_num):
+        cor = _get_max_cor(iou)
+        cor_mask = iou[torch.tensor([range(batch_size)]), cor[:, 0], cor[:, 1]]
+        one_mask = (cor_mask >= threshold).type(torch.float).view(-1, 1)
+        revert_mask = (cor_mask < threshold).type(torch.float).view(-1, 1)
+        one_mask = torch.cat((one_mask, torch.ones_like(one_mask)), dim=1)
+        revert_mask = torch.cat((revert_mask, torch.zeros_like(revert_mask)), dim=1)
+        iou.index_put_((torch.tensor([range(batch_size)]), cor[:, 0], cor[:, 1]), torch.zeros(1))
+        print(iou)
+        cor = cor.type(torch.float) * one_mask - revert_mask
+        print(cor)
+        box_kind.scatter_(1, cor[:, 1].view(-1, 1).type(torch.long), cor[:, 0].view(-1, 1) + 1)
+    print(cor)
+    print(box_kind)
+    return box_kind
+
+
+if __name__ == '__main__':
+    anchors = torch.tensor([[0, 0.1, 0.2, 0.3], [0.15, 0.2, 0.4, 0.4],
+                            [0.63, 0.05, 0.88, 0.98], [0.66, 0.45, 0.8, 0.8],
+                            [0.57, 0.3, 0.92, 0.9]])
+    ground_truth = torch.tensor([[0, 0.1, 0.08, 0.52, 0.92],
+                                 [1, 0.55, 0.2, 0.9, 0.88]])
+    anchors = anchors.view(1, *anchors.shape)
+    ground_truth = ground_truth.view(1, *ground_truth.shape)
+    multi_box_target(torch.cat((anchors, anchors), dim=0), torch.cat((ground_truth, ground_truth), dim=0))
